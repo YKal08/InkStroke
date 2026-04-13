@@ -356,10 +356,23 @@ class Inkstroke(QWidget):
     def px_to_mm(self, px_value):
         return px_value / PIXELS_PER_MM
 
+    def px_to_machine_mm(self, x_px, y_px):
+        x_mm = self.px_to_mm(x_px)
+        y_mm = DRAWING_HEIGHT_MM - self.px_to_mm(y_px)
+        x_mm = max(0.0, min(DRAWING_WIDTH_MM, x_mm))
+        y_mm = max(0.0, min(DRAWING_HEIGHT_MM, y_mm))
+        return x_mm, y_mm
+
+    def machine_mm_to_px(self, x_mm, y_mm):
+        x_px = self.mm_to_px(x_mm)
+        y_px = self.mm_to_px(DRAWING_HEIGHT_MM - y_mm)
+        return x_px, y_px
+
     def px_point_to_mm(self, point):
+        x_mm, y_mm = self.px_to_machine_mm(point.x(), point.y())
         return {
-            'x': self.px_to_mm(point.x()),
-            'y': self.px_to_mm(point.y()),
+            'x': x_mm,
+            'y': y_mm,
             'p': point.get('p', self.current_pressure_mm) if isinstance(point, dict) else self.current_pressure_mm,
         }
 
@@ -450,12 +463,9 @@ class Inkstroke(QWidget):
         # 1. Print Coordinates (The "Machine" Output)
         if not stroke_data: return
         stroke_data_mm = [
-            {
-                'x': self.px_to_mm(p['x']),
-                'y': self.px_to_mm(p['y']),
-                'p': p['p'],
-            }
+            {'x': x_mm, 'y': y_mm, 'p': p['p']}
             for p in stroke_data
+            for x_mm, y_mm in [self.px_to_machine_mm(p['x'], p['y'])]
         ]
         
         print(f"\n[COMMIT] Sending stroke to machine ({len(stroke_data_mm)} pts, mm)...")
@@ -823,11 +833,11 @@ class Inkstroke(QWidget):
         
         for path in final_robot_paths:
             if not path: continue
-            path_mm = [{
-                'x': self.px_to_mm(v['x']),
-                'y': self.px_to_mm(v['y']),
-                'p': v['p'],
-            } for v in path]
+            path_mm = [
+                {'x': x_mm, 'y': y_mm, 'p': v['p']}
+                for v in path
+                for x_mm, y_mm in [self.px_to_machine_mm(v['x'], v['y'])]
+            ]
             start = path_mm[0]
             print(f"[ START ] X: {start['x']:>8.2f}, Y: {start['y']:>8.2f} | P: {start['p']:.3f}")
             if len(path_mm) > 1:
@@ -838,8 +848,10 @@ class Inkstroke(QWidget):
                     p2 = QPointF(p2_dat['x'], p2_dat['y'])
                     pressure = p1_dat['p']
                     print(f"[ MOVE  ] X: {p2.x():>8.2f}, Y: {p2.y():>8.2f} | P: {pressure:.3f}")
-                    p1_px = QPointF(self.mm_to_px(p1.x()), self.mm_to_px(p1.y()))
-                    p2_px = QPointF(self.mm_to_px(p2.x()), self.mm_to_px(p2.y()))
+                    p1_px_x, p1_px_y = self.machine_mm_to_px(p1.x(), p1.y())
+                    p2_px_x, p2_px_y = self.machine_mm_to_px(p2.x(), p2.y())
+                    p1_px = QPointF(p1_px_x, p1_px_y)
+                    p2_px = QPointF(p2_px_x, p2_px_y)
                     dist = math.hypot(p2_px.x() - p1_px.x(), p2_px.y() - p1_px.y())
                     step = max(1, int(dist / self.mm_to_px(self.spacing_mm)))
                     radius = self.mm_to_px(max(MIN_PEN_MM, pressure) / 2.0)
@@ -925,6 +937,7 @@ class AppWindow(QMainWindow):
 
         machine_layout.addWidget(QLabel("Machine"))
         machine_layout.addWidget(QLabel(f"Area: {DRAWING_WIDTH_MM:.0f} x {DRAWING_HEIGHT_MM:.0f} mm"))
+        machine_layout.addWidget(QLabel("Origin: (0,0) bottom-left"))
 
         serial_row = QHBoxLayout()
         serial_row.setSpacing(6)
