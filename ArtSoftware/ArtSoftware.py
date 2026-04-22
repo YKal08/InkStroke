@@ -3,6 +3,8 @@ import math
 import time
 import copy
 import json
+import threading
+from collections import deque
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QWidget, QScrollArea, QVBoxLayout,
@@ -28,9 +30,9 @@ DRAWING_HEIGHT_MM = 185.0
 PIXELS_PER_MM = 12.0
 WIDTH = int(DRAWING_WIDTH_MM * PIXELS_PER_MM)
 HEIGHT = int(DRAWING_HEIGHT_MM * PIXELS_PER_MM)
-MIN_PEN_MM = 0.1
-MAX_PEN_MM = 3.0
-PRESSURE_FIRMNESS_EXPONENT = 2.2
+LINE_THICKNESS_MM = 0.3
+PEN_STATE_UP = 0
+PEN_STATE_DOWN = 1
 MAX_SKETCH_HISTORY = 100
 
 # --- STYLING ---
@@ -126,6 +128,14 @@ class MachineBridge:
         self.command_queue = []
         self.connected_port = ""
         self.connected_baud = 115200
+
+        self._lock = threading.Lock()
+        self._sender_thread = None
+        self._stop_event = threading.Event()
+        self._has_work = threading.Event()
+        self._pause_requested = False
+        self._paused = False
+
         self.clear_output_log()
 
     def connect_serial(self, port, baud):
@@ -133,15 +143,22 @@ class MachineBridge:
             return False, "pyserial is not installed"
         try:
             self.disconnect_serial()
-            self.serial_conn = serial.Serial(port=port, baudrate=baud, timeout=0.2)
+            self.serial_conn = serial.Serial(port=port, baudrate=baud, timeout=1.0)
             self.connected_port = port
             self.connected_baud = baud
+            time.sleep(0.25)
+            try:
+                self.serial_conn.reset_input_buffer()
+            except Exception:
+                pass
+            self._start_sender()
             return True, f"Connected to {port} @ {baud}"
         except Exception as exc:
             self.serial_conn = None
             return False, f"Serial connection failed: {exc}"
 
     def disconnect_serial(self):
+        self._stop_sender()
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
         self.serial_conn = None
@@ -150,31 +167,109 @@ class MachineBridge:
     def enqueue_stroke(self, stroke_data_mm):
         if not stroke_data_mm:
             return
+        stroke_data_mm = self._compress_stroke(stroke_data_mm)
+
         commands = []
         start = stroke_data_mm[0]
-        commands.append(f"START X{start['x']:.2f} Y{start['y']:.2f} P{start['p']:.3f}")
-        for point in stroke_data_mm[1:]:
-            commands.append(f"MOVE X{point['x']:.2f} Y{point['y']:.2f} P{point['p']:.3f}")
+        commands.append(f"START X{start['x']:.2f} Y{start['y']:.2f}")
+
+        for point in stroke_data_mm[1:-1]:
+            commands.append(f"MOVE X{point['x']:.2f} Y{point['y']:.2f}")
+
         end = stroke_data_mm[-1]
-        commands.append(f"END X{end['x']:.2f} Y{end['y']:.2f} P0.000")
-        self.command_queue.extend(commands)
+        commands.append(f"END X{end['x']:.2f} Y{end['y']:.2f}")
+        with self._lock:
+            self.command_queue.extend(commands)
         self._persist_stroke_json(stroke_data_mm)
 
-    def flush_queue(self):
-        if not self.command_queue:
-            return
-        sent_any = False
-        if self.serial_conn and self.serial_conn.is_open:
-            while self.command_queue:
-                command = self.command_queue.pop(0)
-                self.serial_conn.write((command + "\n").encode("ascii", errors="ignore"))
-                sent_any = True
+    def _compress_stroke(self, stroke_data_mm):
+        if len(stroke_data_mm) <= 2:
+            return stroke_data_mm
 
-        if sent_any and not self.command_queue:
-            self.clear_output_log()
+        # 1. RDP Line Simplification - Fine Tuned
+        def rdp_simplify(points, epsilon_mm):
+            if len(points) < 3:
+                return points
+
+            def point_line_distance(p, a, b):
+                den = math.hypot(b['y'] - a['y'], b['x'] - a['x'])
+                if den == 0:
+                    return math.hypot(p['x'] - a['x'], p['y'] - a['y'])
+                return abs((b['y'] - a['y'])*p['x'] - (b['x'] - a['x'])*p['y'] + b['x']*a['y'] - b['y']*a['x']) / den
+
+            dmax = 0.0
+            index = 0
+            end = len(points) - 1
+            for i in range(1, end):
+                d = point_line_distance(points[i], points[0], points[end])
+                if d > dmax:
+                    index = i
+                    dmax = d
+
+            if dmax > epsilon_mm:
+                left = rdp_simplify(points[:index+1], epsilon_mm)
+                right = rdp_simplify(points[index:], epsilon_mm)
+                return left[:-1] + right
+            else:
+                return [points[0], points[end]]
+
+        # FINE TUNED: 0.08 preserves beautiful curves while shedding useless tablet jitter
+        simplified = rdp_simplify(stroke_data_mm, 0.08)
+
+        # 2. Minimum Distance Filter - Fine Tuned
+        final_stroke = [simplified[0]]
+        last = simplified[0]
+
+        for point in simplified[1:-1]:
+            dist = math.hypot(point['x'] - last['x'], point['y'] - last['y'])
+
+            # FINE TUNED: 0.3mm distance forces the machine to process evenly spaced vectors 
+            # without making them look blocky on paper.
+            if dist >= 0.3:
+                final_stroke.append(point)
+                last = point
+
+        final_stroke.append(simplified[-1])
+        return final_stroke
+
+    def flush_queue(self):
+        self._has_work.set()
+
+    def request_pause(self):
+        with self._lock:
+            self._pause_requested = True
+            # If idle, pause immediately.
+            if not self.command_queue:
+                self._paused = True
+        self._has_work.set()
+
+    def resume_queue(self):
+        with self._lock:
+            self._pause_requested = False
+            self._paused = False
+        self._has_work.set()
+
+    def is_paused(self):
+        with self._lock:
+            return self._paused
+
+    def is_pause_requested(self):
+        with self._lock:
+            return self._pause_requested
 
     def clear_pending_queue(self):
-        self.command_queue.clear()
+        with self._lock:
+            self.command_queue.clear()
+
+    def get_pending_count(self):
+        with self._lock:
+            return len(self.command_queue)
+
+    def get_queue_preview(self, max_items=40):
+        with self._lock:
+            if not self.command_queue:
+                return []
+            return list(self.command_queue[-max_items:])
 
     def clear_output_log(self):
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +279,114 @@ class MachineBridge:
     def clear_all(self):
         self.clear_pending_queue()
         self.clear_output_log()
+
+    def _start_sender(self):
+        self._stop_event.clear()
+        if self._sender_thread and self._sender_thread.is_alive():
+            return
+        self._sender_thread = threading.Thread(
+            target=self._sender_loop, daemon=True, name="machine-sender"
+        )
+        self._sender_thread.start()
+
+    def _stop_sender(self):
+        self._stop_event.set()
+        self._has_work.set()
+        if self._sender_thread and self._sender_thread.is_alive():
+            self._sender_thread.join(timeout=2.0)
+
+    def _sender_loop(self):
+        in_flight = 0
+        in_flight_cmds = deque()
+        # PIPELINE FIX: We keep exactly 2 commands active.
+        # 1 executes on the Arduino, while the 2nd sits in the Arduino's 64-byte RAM buffer.
+        # This completely eliminates USB latency lag between moves.
+        MAX_IN_FLIGHT = 2 
+
+        while not self._stop_event.is_set():
+            with self._lock:
+                queue_has_items = len(self.command_queue) > 0
+                paused = self._paused
+                pause_requested = self._pause_requested
+
+            if paused:
+                self._has_work.wait()
+                self._has_work.clear()
+                continue
+
+            if not queue_has_items and in_flight == 0:
+                self._has_work.wait()
+                self._has_work.clear()
+                continue
+
+            conn = self.serial_conn
+            if conn is None or not conn.is_open:
+                in_flight = 0
+                time.sleep(0.1)
+                continue
+
+            # Fill the pipeline buffer
+            while in_flight < MAX_IN_FLIGHT:
+                with self._lock:
+                    pause_requested = self._pause_requested
+                if pause_requested:
+                    break
+
+                with self._lock:
+                    if not self.command_queue:
+                        break
+                    command = self.command_queue.pop(0)
+
+                try:
+                    conn.write((command + "\n").encode("ascii", errors="ignore"))
+                    conn.flush()
+                    in_flight += 1
+                    in_flight_cmds.append(command)
+                except Exception as exc:
+                    print(f"[BRIDGE] send error: {exc}")
+                    with self._lock:
+                        self.command_queue.insert(0, command)
+                    break
+
+            # Wait for at least ONE command to finish to clear space in the pipeline
+            if in_flight > 0:
+                if self._wait_for_ok(conn, timeout_seconds=20.0):
+                    in_flight -= 1
+
+                    completed_cmd = in_flight_cmds.popleft() if in_flight_cmds else ""
+                    if completed_cmd.startswith("END"):
+                        with self._lock:
+                            if self._pause_requested:
+                                self._paused = True
+                                self._pause_requested = False
+                else:
+                    in_flight = 0
+                    in_flight_cmds.clear()
+
+        with self._lock:
+            if not self.command_queue:
+                self.clear_output_log()
+
+    def _wait_for_ok(self, conn, timeout_seconds=20.0):
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline and not self._stop_event.is_set():
+            try:
+                # Polling approach allows us to yield without locking the serial buffer
+                if conn.in_waiting > 0:
+                    response = conn.readline().decode("ascii", errors="ignore").strip()
+                    if not response:
+                        continue
+                    if response == "OK":
+                        return True
+                    print(f"[MACHINE] {response}")
+                else:
+                    time.sleep(0.001)
+            except Exception as exc:
+                print(f"[BRIDGE] ack read error: {exc}")
+                return False
+
+        print("[BRIDGE] timeout waiting for OK")
+        return False
 
     def _persist_stroke_json(self, stroke_data_mm):
         payload = {
@@ -222,22 +425,17 @@ class Navigator(QWidget):
         offset_y = 20
         self.target_rect = QRectF(offset_x, offset_y, draw_w, draw_h)
 
-        # Draw a composite thumbnail
-        thumb = QImage(self.target_rect.size().toSize() * 2, QImage.Format_ARGB32)
+        thumb = QImage(self.target_rect.size().toSize(), QImage.Format_ARGB32)
         thumb.fill(Qt.white)
         
         thumb_painter = QPainter(thumb)
-        thumb_painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        thumb_painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
         
-        # Scale layers down to thumbnail size
-        target_size = self.target_rect.size().toSize() * 2
+        target_size = self.target_rect.size().toSize()
         dest_rect = QRectF(0,0, target_size.width(), target_size.height())
         
-        # 1. Draw Sketch
         thumb_painter.drawImage(dest_rect, self.canvas_ref.layer_sketch)
-        # 2. Draw Ink (Permanent)
         thumb_painter.drawImage(dest_rect, self.canvas_ref.layer_ink)
-        # 3. Draw Ink (Feedback/Buffer)
         thumb_painter.drawImage(dest_rect, self.canvas_ref.layer_feedback)
         
         thumb_painter.end()
@@ -246,7 +444,7 @@ class Navigator(QWidget):
         painter.fillRect(self.target_rect, Qt.white)
 
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.setOpacity(0.9)
         painter.drawImage(self.target_rect, thumb)
         painter.setOpacity(1.0)
@@ -302,21 +500,16 @@ class Inkstroke(QWidget):
         
         self.setFixedSize(int(WIDTH * self.zoom_level), int(HEIGHT * self.zoom_level))
         
-        # --- LAYERS ---
         self.layer_sketch = QImage(WIDTH, HEIGHT, QImage.Format_ARGB32)
         self.layer_sketch.fill(Qt.transparent)
         
         self.layer_ink = QImage(WIDTH, HEIGHT, QImage.Format_ARGB32)
         self.layer_ink.fill(Qt.transparent)
 
-        # Temp layer for stroke preview while drawing
         self.layer_feedback = QImage(WIDTH, HEIGHT, QImage.Format_ARGB32)
         self.layer_feedback.fill(Qt.transparent)
 
-        # --- SKETCH DATA & HISTORY ---
-        # List of strokes. Each stroke is a list of dicts: {'x': val, 'y': val, 'p': val}
         self.sketch_strokes = [] 
-        # Undo/Redo Stacks
         self.sketch_history = [] 
         self.sketch_redo_stack = []
 
@@ -328,14 +521,12 @@ class Inkstroke(QWidget):
         self.current_pos = None
         self.nav_ref = None
         
-        # --- Brush settings ---
         self.eraser_size_mm = 6.0
         self.flow = 0.8
         self.spacing_mm = 0.2
-        self.current_pressure_mm = 1.0
+        self.current_pen_state = PEN_STATE_DOWN
         self._last_pan_pos = QPoint()
 
-        # --- Cursor State ---
         self.cursor_screen_pos = QPointF(-100, -100)
         self.is_hovering = False
         
@@ -373,59 +564,48 @@ class Inkstroke(QWidget):
         return {
             'x': x_mm,
             'y': y_mm,
-            'p': point.get('p', self.current_pressure_mm) if isinstance(point, dict) else self.current_pressure_mm,
+            'p': point.get('p', PEN_STATE_DOWN) if isinstance(point, dict) else PEN_STATE_DOWN,
         }
 
-    def normalize_pressure_mm(self, pressure_value):
-        p = max(0.0, min(1.0, pressure_value))
-        # Firm tip response: average pressure stays near 1 mm, max is harder to reach.
-        p_firm = pow(p, PRESSURE_FIRMNESS_EXPONENT)
-        return MIN_PEN_MM + (MAX_PEN_MM - MIN_PEN_MM) * p_firm
+    def _capture_sketch_state(self):
+        return {
+            'strokes': copy.deepcopy(self.sketch_strokes),
+            'layer': self.layer_sketch.copy(),
+        }
 
-    # --- UNDO / REDO LOGIC ---
+    def _restore_sketch_state(self, state):
+        self.sketch_strokes = copy.deepcopy(state['strokes'])
+        self.layer_sketch = state['layer'].copy()
+        self.update()
     
     def save_sketch_state(self):
-        """Pushes current sketch state to history before a new stroke."""
         if len(self.sketch_history) >= MAX_SKETCH_HISTORY:
             self.sketch_history.pop(0)
-        self.sketch_history.append(copy.deepcopy(self.sketch_strokes))
+        self.sketch_history.append(self._capture_sketch_state())
         self.sketch_redo_stack.clear()
 
     def perform_undo(self):
-        """Context aware undo."""
         if self.current_tool == TOOL_SKETCH or self.current_tool == TOOL_ERASER_SKETCH:
             if self.sketch_history:
                 if len(self.sketch_redo_stack) >= MAX_SKETCH_HISTORY:
                     self.sketch_redo_stack.pop(0)
-                self.sketch_redo_stack.append(copy.deepcopy(self.sketch_strokes))
-                self.sketch_strokes = self.sketch_history.pop()
-                self.redraw_sketch_layer()
+                self.sketch_redo_stack.append(self._capture_sketch_state())
+                self._restore_sketch_state(self.sketch_history.pop())
         elif self.current_tool == TOOL_INK:
-            print(">> Undo: Ink commits immediately and cannot be undone.")
+            pass
 
     def perform_redo(self):
-        """Context aware redo."""
         if self.current_tool == TOOL_SKETCH or self.current_tool == TOOL_ERASER_SKETCH:
             if self.sketch_redo_stack:
                 if len(self.sketch_history) >= MAX_SKETCH_HISTORY:
                     self.sketch_history.pop(0)
-                self.sketch_history.append(copy.deepcopy(self.sketch_strokes))
-                next_state = self.sketch_redo_stack.pop()
-                self.sketch_strokes = next_state
-                self.redraw_sketch_layer()
-        
+                self.sketch_history.append(self._capture_sketch_state())
+                self._restore_sketch_state(self.sketch_redo_stack.pop())
         elif self.current_tool == TOOL_INK:
-            # Redo for buffer is complex due to timing. 
-            # Simplified: No Redo for delayed buffer once undone.
             pass
 
     def redraw_sketch_layer(self):
-        """Clears and redraws the sketch layer from the vector data."""
         self.layer_sketch.fill(Qt.transparent)
-        
-        # We temporarily set tool to SKETCH to reuse draw_line logic correctly
-        # or we just manually replicate drawing logic.
-        # Manual is safer to avoid side effects.
         
         painter = QPainter(self.layer_sketch)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -443,9 +623,8 @@ class Inkstroke(QWidget):
                 
                 pt1 = QPointF(p1['x'], p1['y'])
                 pt2 = QPointF(p2['x'], p2['y'])
-                pressure = p1['p']
-                
-                radius = self.mm_to_px(max(MIN_PEN_MM, pressure) / 2.0)
+
+                radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
                 dist = math.hypot(pt2.x() - pt1.x(), pt2.y() - pt1.y())
                 step = max(1, int(dist / self.mm_to_px(self.spacing_mm)))
                 
@@ -456,33 +635,29 @@ class Inkstroke(QWidget):
                     painter.drawEllipse(QPointF(x, y), radius, radius)
         painter.end()
         self.update()
-        if self.nav_ref: self.nav_ref.update()
 
     def commit_ink_stroke(self, stroke_data):
-        """Burns the stroke into the permanent layer and prints coordinates."""
-        # 1. Print Coordinates (The "Machine" Output)
         if not stroke_data: return
         stroke_data_mm = [
-            {'x': x_mm, 'y': y_mm, 'p': p['p']}
+            {'x': x_mm, 'y': y_mm, 'p': PEN_STATE_DOWN}
             for p in stroke_data
             for x_mm, y_mm in [self.px_to_machine_mm(p['x'], p['y'])]
         ]
         
         print(f"\n[COMMIT] Sending stroke to machine ({len(stroke_data_mm)} pts, mm)...")
         start = stroke_data_mm[0]
-        print(f"[ START ] X: {start['x']:>8.2f}, Y: {start['y']:>8.2f} | P: {start['p']:.3f}")
+        print(f"[ START ] X: {start['x']:>8.2f}, Y: {start['y']:>8.2f}")
         
         for i in range(len(stroke_data_mm)-1):
             p2 = stroke_data_mm[i+1]
-            print(f"[ MOVE  ] X: {p2['x']:>8.2f}, Y: {p2['y']:>8.2f} | P: {p2['p']:.3f}")
+            print(f"[ MOVE  ] X: {p2['x']:>8.2f}, Y: {p2['y']:>8.2f}")
             
         end = stroke_data_mm[-1]
-        print(f"[  END  ] X: {end['x']:>8.2f}, Y: {end['y']:>8.2f} | P: 0.000")
+        print(f"[  END  ] X: {end['x']:>8.2f}, Y: {end['y']:>8.2f}")
 
         self.machine_bridge.enqueue_stroke(stroke_data_mm)
         self.machine_bridge.flush_queue()
 
-        # 2. Draw to Permanent Layer
         painter = QPainter(self.layer_ink)
         painter.setRenderHint(QPainter.Antialiasing)
         c = QColor(0, 0, 0)
@@ -496,7 +671,7 @@ class Inkstroke(QWidget):
             
             pt1 = QPointF(p1['x'], p1['y'])
             pt2 = QPointF(p2['x'], p2['y'])
-            radius = self.mm_to_px(max(MIN_PEN_MM, p1['p']) / 2.0)
+            radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
             
             dist = math.hypot(pt2.x() - pt1.x(), pt2.y() - pt1.y())
             step = max(1, int(dist / self.mm_to_px(self.spacing_mm)))
@@ -509,7 +684,6 @@ class Inkstroke(QWidget):
         painter.end()
 
     def refresh_feedback_layer(self):
-        """Redraws the feedback layer for the in-progress stroke only."""
         self.layer_feedback.fill(Qt.transparent)
         
         painter = QPainter(self.layer_feedback)
@@ -519,7 +693,6 @@ class Inkstroke(QWidget):
         painter.setBrush(c)
         painter.setPen(Qt.NoPen)
         
-        # Helper to draw a path
         def paint_path(data):
             if len(data) < 2: return
             for i in range(len(data) - 1):
@@ -528,7 +701,7 @@ class Inkstroke(QWidget):
                 pt1 = QPointF(p1['x'], p1['y'])
                 pt2 = QPointF(p2['x'], p2['y'])
                 dist = math.hypot(pt2.x() - pt1.x(), pt2.y() - pt1.y())
-                radius = self.mm_to_px(max(MIN_PEN_MM, p1['p']) / 2.0)
+                radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
                 step = max(1, int(dist / self.mm_to_px(self.spacing_mm)))
                 for s in range(step + 1):
                     t = s / step
@@ -536,11 +709,6 @@ class Inkstroke(QWidget):
                     y = pt1.y() + (pt2.y() - pt1.y()) * t
                     painter.drawEllipse(QPointF(x, y), radius, radius)
 
-        # Draw current stroke (if drawing)
-        # We don't need to explicitly draw current stroke here because draw_line
-        # adds to layer_feedback incrementally. However, if we cleared layer_feedback,
-        # we lost the current stroke visual! 
-        # So we must re-draw current_stroke_data if we are mid-draw.
         if self.drawing and self.current_tool == TOOL_INK and self.current_stroke_data:
             paint_path(self.current_stroke_data)
 
@@ -561,19 +729,14 @@ class Inkstroke(QWidget):
         new_stabilized_pos = QPointF(nx, ny)
 
         if self.drawing:
-            # For INK, we do NOT print coordinates here anymore.
-            # We record them.
             self.draw_line(self.current_pos, new_stabilized_pos)
             
-            # Record Data
             if self.current_tool == TOOL_SKETCH or self.current_tool == TOOL_INK:
                 self.current_stroke_data.append({
                     'x': new_stabilized_pos.x(),
                     'y': new_stabilized_pos.y(),
-                    'p': self.current_pressure_mm
+                    'p': PEN_STATE_DOWN
                 })
-
-            if self.nav_ref: self.nav_ref.update()
         
         self.current_pos = new_stabilized_pos
 
@@ -585,26 +748,24 @@ class Inkstroke(QWidget):
         brush_color = Qt.black
         comp_mode = QPainter.CompositionMode_SourceOver
         
-        # --- Logic for Radius Size & Target ---
-        radius = self.mm_to_px(MIN_PEN_MM / 2.0)
+        radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
         
         if self.current_tool == TOOL_INK:
-            # Ink draws to FEEDBACK layer (temporary/buffered)
             target_layer = self.layer_feedback
             brush_color = QColor(0, 0, 0)
-            radius = self.mm_to_px(max(MIN_PEN_MM, self.current_pressure_mm) / 2.0)
+            radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
             
         elif self.current_tool == TOOL_SKETCH:
             target_layer = self.layer_sketch
             brush_color = QColor(100, 149, 237)
-            radius = self.mm_to_px(max(MIN_PEN_MM, self.current_pressure_mm) / 2.0)
+            radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
             
         elif self.current_tool == TOOL_ERASER_SKETCH:
             target_layer = self.layer_sketch 
             brush_color = Qt.transparent
             comp_mode = QPainter.CompositionMode_Clear 
             base_r = self.mm_to_px(float(self.eraser_size_mm) / 2.0)
-            radius = base_r * max(0.2, self.current_pressure_mm / MAX_PEN_MM)
+            radius = base_r
         
         if target_layer is None: return
 
@@ -636,36 +797,31 @@ class Inkstroke(QWidget):
         self.cursor_screen_pos = event.position()
         self.is_hovering = True
         
-        self.current_pressure_mm = self.normalize_pressure_mm(event.pressure())
         pos_canvas = self.get_canvas_coords(event.position())
         
         if event.type() == QTabletEvent.TabletPress:
             self.drawing = True
             self.current_pos = pos_canvas
             
-            # Start Recording
             self.current_stroke_data = []
             
-            # If Sketching, save history state BEFORE starting the new stroke
-            if self.current_tool == TOOL_SKETCH:
+            if self.current_tool == TOOL_SKETCH or self.current_tool == TOOL_ERASER_SKETCH:
                 self.save_sketch_state()
             
             self.current_stroke_data.append({
                 'x': pos_canvas.x(), 
                 'y': pos_canvas.y(), 
-                'p': self.current_pressure_mm
+                'p': PEN_STATE_DOWN
             })
         
         elif event.type() == QTabletEvent.TabletRelease:
             if self.current_pos:
-                # Add end point
                  self.current_stroke_data.append({
                     'x': self.current_pos.x(), 
                     'y': self.current_pos.y(), 
-                          'p': MIN_PEN_MM
+                          'p': PEN_STATE_UP
                 })
             
-            # FINALIZE STROKE LOGIC
             if self.current_stroke_data:
                 if self.current_tool == TOOL_SKETCH:
                     self.sketch_strokes.append(self.current_stroke_data)
@@ -692,15 +848,15 @@ class Inkstroke(QWidget):
 
         if event.button() == Qt.LeftButton:
             self.drawing = True
-            self.current_pressure_mm = 1.0
+            self.current_pen_state = PEN_STATE_DOWN
             pos = self.get_canvas_coords(event.position())
             self.current_pos = pos
             
             self.current_stroke_data = []
-            if self.current_tool == TOOL_SKETCH:
+            if self.current_tool == TOOL_SKETCH or self.current_tool == TOOL_ERASER_SKETCH:
                 self.save_sketch_state()
             
-            self.current_stroke_data.append({'x': pos.x(), 'y': pos.y(), 'p': self.current_pressure_mm})
+            self.current_stroke_data.append({'x': pos.x(), 'y': pos.y(), 'p': PEN_STATE_DOWN})
 
     def mouseMoveEvent(self, event):
         self.cursor_screen_pos = event.position()
@@ -728,7 +884,7 @@ class Inkstroke(QWidget):
             self.setCursor(Qt.BlankCursor)
         if event.button() == Qt.LeftButton:
             if self.current_pos:
-                 self.current_stroke_data.append({'x': self.current_pos.x(), 'y': self.current_pos.y(), 'p': MIN_PEN_MM})
+                 self.current_stroke_data.append({'x': self.current_pos.x(), 'y': self.current_pos.y(), 'p': PEN_STATE_UP})
 
             if self.current_stroke_data:
                 if self.current_tool == TOOL_SKETCH:
@@ -748,18 +904,17 @@ class Inkstroke(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
         
-        # 1. Background
+        if self.drawing:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        else:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            
         painter.fillRect(self.rect(), Qt.white)
-        # 2. Sketch Layer
         painter.drawImage(self.rect(), self.layer_sketch)
-        # 3. Permanent Ink Layer
         painter.drawImage(self.rect(), self.layer_ink)
-        # 4. Feedback (Buffer) Ink Layer
         painter.drawImage(self.rect(), self.layer_feedback)
 
-        # 5. CUSTOM CURSOR DRAWING (Overlay)
         if self.is_hovering:
             painter.setTransform(QTransform())
             cx, cy = self.cursor_screen_pos.x(), self.cursor_screen_pos.y()
@@ -768,7 +923,7 @@ class Inkstroke(QWidget):
             if self.current_tool == TOOL_ERASER_SKETCH:
                 tool_radius = self.mm_to_px(float(self.eraser_size_mm) / 2.0)
             else:
-                tool_radius = self.mm_to_px(max(MIN_PEN_MM, self.current_pressure_mm) / 2.0)
+                tool_radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
             
             screen_radius = tool_radius * self.zoom_level
             gap_size = 4    
@@ -800,7 +955,6 @@ class Inkstroke(QWidget):
             painter.setOpacity(1.0)
             
     def convert_sketch_to_ink(self):
-        """Converts sketch layer to ink, respecting erased areas."""
         print("\n" + "="*40)
         print("    ROBOT COORDINATES MM (CONVERSION OUTPUT)")
         print("="*40)
@@ -809,7 +963,7 @@ class Inkstroke(QWidget):
         for stroke in self.sketch_strokes:
             current_segment = []
             for point_data in stroke:
-                x, y, p = point_data['x'], point_data['y'], point_data['p']
+                x, y = point_data['x'], point_data['y']
                 ix, iy = int(x), int(y)
                 is_visible = False
                 if 0 <= ix < WIDTH and 0 <= iy < HEIGHT:
@@ -834,34 +988,33 @@ class Inkstroke(QWidget):
         for path in final_robot_paths:
             if not path: continue
             path_mm = [
-                {'x': x_mm, 'y': y_mm, 'p': v['p']}
+                {'x': x_mm, 'y': y_mm, 'p': PEN_STATE_DOWN}
                 for v in path
                 for x_mm, y_mm in [self.px_to_machine_mm(v['x'], v['y'])]
             ]
             start = path_mm[0]
-            print(f"[ START ] X: {start['x']:>8.2f}, Y: {start['y']:>8.2f} | P: {start['p']:.3f}")
+            print(f"[ START ] X: {start['x']:>8.2f}, Y: {start['y']:>8.2f}")
             if len(path_mm) > 1:
                 for i in range(len(path_mm) - 1):
                     p1_dat = path_mm[i]
                     p2_dat = path_mm[i+1]
                     p1 = QPointF(p1_dat['x'], p1_dat['y'])
                     p2 = QPointF(p2_dat['x'], p2_dat['y'])
-                    pressure = p1_dat['p']
-                    print(f"[ MOVE  ] X: {p2.x():>8.2f}, Y: {p2.y():>8.2f} | P: {pressure:.3f}")
+                    print(f"[ MOVE  ] X: {p2.x():>8.2f}, Y: {p2.y():>8.2f}")
                     p1_px_x, p1_px_y = self.machine_mm_to_px(p1.x(), p1.y())
                     p2_px_x, p2_px_y = self.machine_mm_to_px(p2.x(), p2.y())
                     p1_px = QPointF(p1_px_x, p1_px_y)
                     p2_px = QPointF(p2_px_x, p2_px_y)
                     dist = math.hypot(p2_px.x() - p1_px.x(), p2_px.y() - p1_px.y())
                     step = max(1, int(dist / self.mm_to_px(self.spacing_mm)))
-                    radius = self.mm_to_px(max(MIN_PEN_MM, pressure) / 2.0)
+                    radius = self.mm_to_px(LINE_THICKNESS_MM / 2.0)
                     for s in range(step + 1):
                         t = s / step
                         lx = p1_px.x() + (p2_px.x() - p1_px.x()) * t
                         ly = p1_px.y() + (p2_px.y() - p1_px.y()) * t
                         painter.drawEllipse(QPointF(lx, ly), radius, radius)
             end = path_mm[-1]
-            print(f"[  END  ] X: {end['x']:>8.2f}, Y: {end['y']:>8.2f} | P: 0.000")
+            print(f"[  END  ] X: {end['x']:>8.2f}, Y: {end['y']:>8.2f}")
 
             self.machine_bridge.enqueue_stroke(path_mm)
             self.machine_bridge.flush_queue()
@@ -873,7 +1026,6 @@ class Inkstroke(QWidget):
         self.sketch_history = []
         self.sketch_redo_stack = []
         self.update()
-        if self.nav_ref: self.nav_ref.update()
 
 class AppWindow(QMainWindow):
     def __init__(self):
@@ -888,8 +1040,8 @@ class AppWindow(QMainWindow):
         self.scroll.setAlignment(Qt.AlignCenter)
         self.scroll.setStyleSheet("QScrollArea { border: none; background-color: #121212; }")
         
-        self.scroll.verticalScrollBar().valueChanged.connect(self.update_nav)
-        self.scroll.horizontalScrollBar().valueChanged.connect(self.update_nav)
+        self.scroll.verticalScrollBar().valueChanged.connect(self.update_nav_immediate)
+        self.scroll.horizontalScrollBar().valueChanged.connect(self.update_nav_immediate)
         self.scroll.installEventFilter(self)
         self.scroll.viewport().installEventFilter(self)
 
@@ -919,6 +1071,10 @@ class AppWindow(QMainWindow):
         self.queue_timer.timeout.connect(self.update_queue_monitor)
         self.queue_timer.start(300)
         self.update_queue_monitor()
+        
+        self.nav_timer = QTimer(self)
+        self.nav_timer.timeout.connect(self.update_nav_background)
+        self.nav_timer.start(250)
 
     def setup_right_panel(self):
         self.right_panel = QWidget()
@@ -976,6 +1132,10 @@ class AppWindow(QMainWindow):
         btn_clear_queue.clicked.connect(self.clear_pending_queue)
         machine_layout.addWidget(btn_clear_queue)
 
+        self.btn_pause_queue = QPushButton("Pause Sending")
+        self.btn_pause_queue.clicked.connect(self.toggle_pause_queue)
+        machine_layout.addWidget(self.btn_pause_queue)
+
         panel_layout.addWidget(machine_panel, 3)
 
     def setup_menus(self):
@@ -1005,9 +1165,8 @@ class AppWindow(QMainWindow):
         action_exit.triggered.connect(self.close)
         file_menu.addAction(action_exit)
         
-        # --- Edit Actions ---
         action_undo = QAction("Undo", self)
-        action_undo.setShortcut(QKeySequence.Undo) # Ctrl+Z
+        action_undo.setShortcut(QKeySequence.Undo) 
         action_undo.triggered.connect(self.canvas_widget.perform_undo)
         edit_menu.addAction(action_undo)
 
@@ -1067,7 +1226,6 @@ class AppWindow(QMainWindow):
         self.top_bar.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, self.top_bar)
         
-        # Undo/Redo Buttons
         btn_undo = QPushButton("↺")
         btn_undo.setToolTip("Undo (Ctrl+Z)")
         btn_undo.clicked.connect(self.canvas_widget.perform_undo)
@@ -1080,7 +1238,6 @@ class AppWindow(QMainWindow):
         
         self.top_bar.addSeparator()
 
-        # Stabilization
         self.top_bar.addWidget(QLabel("  Stabilization:  "))
         self.slider_stab = QSlider(Qt.Horizontal)
         self.slider_stab.setRange(0, 95)
@@ -1102,7 +1259,6 @@ class AppWindow(QMainWindow):
         
         self.top_bar.addSeparator()
 
-        # Eraser Size (Initially Hidden)
         self.lbl_eraser = QLabel("  Eraser (mm):  ")
         self.top_bar.addWidget(self.lbl_eraser)
         
@@ -1217,8 +1373,12 @@ class AppWindow(QMainWindow):
 
         self.update_queue_monitor()
 
-    def update_nav(self):
+    def update_nav_immediate(self):
         self.navigator.update()
+        
+    def update_nav_background(self):
+        if self.navigator.isVisible():
+            self.navigator.update()
 
     def clear_pending_queue(self):
         self.canvas_widget.machine_bridge.clear_all()
@@ -1227,8 +1387,10 @@ class AppWindow(QMainWindow):
 
     def update_queue_monitor(self):
         bridge = self.canvas_widget.machine_bridge
-        pending = len(bridge.command_queue)
+        pending = bridge.get_pending_count()
         connected = bridge.serial_conn and bridge.serial_conn.is_open
+        paused = bridge.is_paused()
+        pause_requested = bridge.is_pause_requested()
 
         if connected:
             serial_text = f"Serial: {bridge.connected_port} @ {bridge.connected_baud}"
@@ -1236,13 +1398,35 @@ class AppWindow(QMainWindow):
             serial_text = "Serial: disconnected"
 
         self.lbl_serial_state.setText(serial_text)
-        self.lbl_queue_state.setText(f"Pending commands: {pending}")
+        queue_state = f"Pending commands: {pending}"
+        if paused:
+            queue_state += " (PAUSED)"
+        elif pause_requested:
+            queue_state += " (Pausing at next lift...)"
+        self.lbl_queue_state.setText(queue_state)
+
+        if paused:
+            self.btn_pause_queue.setText("Resume Sending")
+        elif pause_requested:
+            self.btn_pause_queue.setText("Pausing...")
+        else:
+            self.btn_pause_queue.setText("Pause Sending")
 
         if pending:
-            preview = "\n".join(bridge.command_queue[-40:])
+            preview = "\n".join(bridge.get_queue_preview(40))
         else:
             preview = "Queue empty"
         self.queue_view.setPlainText(preview)
+
+    def toggle_pause_queue(self):
+        bridge = self.canvas_widget.machine_bridge
+        if bridge.is_paused():
+            bridge.resume_queue()
+            self.statusBar().showMessage("Queue resumed", 2500)
+        else:
+            bridge.request_pause()
+            self.statusBar().showMessage("Pause requested: waiting for pen-lift boundary", 3000)
+        self.update_queue_monitor()
 
     def clear_sketch_layer(self):
         self.canvas_widget.save_sketch_state()
@@ -1356,9 +1540,8 @@ class AppWindow(QMainWindow):
             self.slider_eraser.setValue(self.slider_eraser.value() + 5)
             return
         elif event.key() == Qt.Key_Delete:
-            # Clear current layer data
             if self.canvas_widget.current_tool == TOOL_SKETCH:
-                 self.canvas_widget.save_sketch_state() # Save before clear
+                 self.canvas_widget.save_sketch_state()
                  self.canvas_widget.layer_sketch.fill(Qt.transparent)
                  self.canvas_widget.sketch_strokes = []
                  self.canvas_widget.update()
